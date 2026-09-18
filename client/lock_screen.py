@@ -5,7 +5,6 @@
 # ============================================================
 
 import tkinter as tk
-from tkinter import font as tkfont
 from PIL import Image, ImageTk
 import os
 import sys
@@ -34,10 +33,14 @@ class LockScreen(tk.Frame):
     """
 
     def __init__(self, parent, on_admin_unlock,
-                 on_member_login_attempt=None, **kwargs):
+                 on_member_login_attempt=None,
+                 on_admin_unlock_attempt=None, **kwargs):
         super().__init__(parent, bg=config.COLOR_BG, **kwargs)
         self.on_admin_unlock          = on_admin_unlock
         self.on_member_login_attempt  = on_member_login_attempt or (lambda u, p: None)
+        # The password is verified by the SERVER (1F) — client PCs no
+        # longer need a copy of the database to unlock.
+        self.on_admin_unlock_attempt  = on_admin_unlock_attempt or (lambda p: False)
         self._click_count             = 0
         self._click_timer             = None
         self._build_ui()
@@ -147,7 +150,8 @@ class LockScreen(tk.Frame):
         self._admin_panel = AdminUnlockPanel(
             self,
             on_unlock=self._do_admin_unlock,
-            on_cancel=self._hide_admin_panel
+            on_cancel=self._hide_admin_panel,
+            on_attempt=self.on_admin_unlock_attempt
         )
 
         # Member login panel (hidden until button click) — 3B
@@ -172,8 +176,42 @@ class LockScreen(tk.Frame):
             self._conn_var.set("● Connected")
             self._conn_lbl.config(fg=config.COLOR_GREEN)
         else:
-            self._conn_var.set("● Connecting to server...")
+            self._conn_var.set("● Server offline — please ask the counter")
             self._conn_lbl.config(fg="#cc4400")
+
+    def set_shop_name(self, name: str):
+        if name and hasattr(self, "_title_lbl"):
+            try:
+                self._title_lbl.config(text=name)
+            except tk.TclError:
+                pass
+
+    def fade_in(self, steps: int = 8):
+        """Cheap, safe fade-in (skipped on platforms without -alpha)."""
+        try:
+            self.attributes("-alpha", 0.0)
+        except tk.TclError:
+            return
+
+        def _step(current):
+            if current > steps:
+                try:
+                    self.attributes("-alpha", 1.0)
+                except tk.TclError:
+                    pass
+                return
+            try:
+                self.attributes("-alpha", current / steps)
+                self.after(28, lambda: _step(current + 1))
+            except tk.TclError:
+                pass
+
+        _step(1)
+
+    def show_admin_result(self, success: bool, reason: str = ""):
+        self._admin_panel.show_result(success, reason)
+        if success:
+            self._do_admin_unlock()
 
     # ── Hidden admin corner ───────────────────────────────────
 
@@ -211,6 +249,12 @@ class LockScreen(tk.Frame):
     def _hide_member_panel(self):
         self._member_panel.place_forget()
 
+    def show_member_result(self, success: bool, message: str):
+        """Answer from the server for a member login attempt."""
+        self._show_member_panel()
+        if hasattr(self._member_panel, "show_result"):
+            self._member_panel.show_result(success, message)
+
     def show_member_login(self):
         """Show the member login panel (called by ClientApp)."""
         self._show_member_panel()
@@ -225,7 +269,7 @@ class AdminUnlockPanel(tk.Frame):
     Correct password → goes to desktop.
     """
 
-    def __init__(self, parent, on_unlock, on_cancel, **kwargs):
+    def __init__(self, parent, on_unlock, on_cancel, on_attempt=None, **kwargs):
         super().__init__(
             parent,
             bg=config.COLOR_BG2,
@@ -234,9 +278,11 @@ class AdminUnlockPanel(tk.Frame):
             highlightbackground=config.COLOR_RED,
             **kwargs
         )
-        self.on_unlock = on_unlock
-        self.on_cancel = on_cancel
-        self._attempts = 0
+        self.on_unlock  = on_unlock
+        self.on_cancel  = on_cancel
+        self.on_attempt = on_attempt or (lambda password: False)
+        self._attempts  = 0
+        self._waiting   = False
         self._build()
 
     def _build(self):
@@ -315,17 +361,39 @@ class AdminUnlockPanel(tk.Frame):
         ).pack(side=tk.LEFT)
 
     def _check(self):
-        import database as db
-        pwd = self._pwd_var.get()
-        correct = db.get_setting("admin_password", config.ADMIN_PASSWORD)
-        if pwd == correct:
+        """Ask the server to verify the password (no local database)."""
+        if self._waiting:
+            return
+        pwd = self._pwd_var.get().strip()
+        if not pwd:
+            return
+        self._waiting = True
+        self._msg_var.set("Checking with the server…")
+        sent = self.on_attempt(pwd)
+        if not sent:
+            self._waiting = False
+            self._msg_var.set("Server offline — cannot verify password.")
+            return
+        self._pwd_var.set("")
+        # If the server never answers (cable pulled) re-enable the panel.
+        self.after(6000, self._timeout)
+
+    def _timeout(self):
+        if self._waiting:
+            self._waiting = False
+            self._msg_var.set("No answer from the server. Try again.")
+
+    def show_result(self, success: bool, reason: str = ""):
+        self._waiting = False
+        if success:
             self._pwd_var.set("")
             self._msg_var.set("")
             self._attempts = 0
-            self.on_unlock()
         else:
             self._attempts += 1
-            self._msg_var.set(f"Wrong password. ({self._attempts} attempt{'s' if self._attempts > 1 else ''})")
+            message = reason or "Wrong admin password"
+            self._msg_var.set(f"{message}. ({self._attempts} attempt"
+                              f"{'s' if self._attempts > 1 else ''})")
             self._pwd_var.set("")
             self._entry.focus_set()
 

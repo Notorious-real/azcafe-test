@@ -5,7 +5,6 @@
 # ============================================================
 
 import tkinter as tk
-from tkinter import font as tkfont
 import os
 import sys
 
@@ -117,7 +116,30 @@ class SessionOverlay(tk.Toplevel):
         sh = self.winfo_screenheight()
         w  = self.winfo_width()
         h  = self.winfo_height()
-        self.geometry(f"+{sw - w - 20}+{sh - h - 60}")
+        self._target_xy = (sw - w - 20, sh - h - 60)
+        self.geometry(f"+{self._target_xy[0]}+{self._target_xy[1]}")
+
+    def slide_in(self, steps: int = 12):
+        """Small polish (7D): slide the overlay up into place."""
+        if not getattr(self, "_target_xy", None):
+            return
+        target_x, target_y = self._target_xy
+
+        def _step(index):
+            if index > steps:
+                try:
+                    self.geometry(f"+{target_x}+{target_y}")
+                except tk.TclError:
+                    pass
+                return
+            offset = int((steps - index) * 8)
+            try:
+                self.geometry(f"+{target_x}+{target_y + offset}")
+                self.after(18, lambda: _step(index + 1))
+            except tk.TclError:
+                pass
+
+        _step(1)
 
     def _drag_start(self, e):
         self._dx = e.x

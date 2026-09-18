@@ -7,7 +7,7 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog
 import sys
 import os
-from datetime import datetime
+
 
 if getattr(sys, 'frozen', False):
     ROOT_DIR = os.path.dirname(sys.executable)
@@ -17,6 +17,7 @@ sys.path.insert(0, ROOT_DIR)
 
 import config
 import database as db
+from server import member_import
 
 
 class MembersPanel(tk.Frame):
@@ -392,43 +393,53 @@ class MembersPanel(tk.Frame):
         messagebox.showinfo("Saved", f"{name}'s details updated.", parent=self)
 
     def _import_csv(self):
+        """
+        6.5D — bulk member import.
+        Understands both the simple AZ Cafe CSV (name,username,password,balance)
+        and the 46-column Cyber Cafe Pro export. Always previews first.
+        """
         from tkinter import filedialog
-        import csv
         path = filedialog.askopenfilename(
             title="Import Members CSV",
-            filetypes=[("CSV Files", "*.csv")]
-        )
+            filetypes=[("CSV Files", "*.csv"), ("All files", "*.*")],
+            parent=self)
         if not path:
             return
-            
-        success = 0
-        errors = 0
+
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    name = row.get("name", "").strip()
-                    uname = row.get("username", "").strip()
-                    pwd = row.get("password", "123456").strip()
-                    bal_str = row.get("balance", "0")
-                    try:
-                        bal = float(bal_str)
-                    except ValueError:
-                        bal = 0.0
-                    
-                    if name and uname:
-                        try:
-                            db.create_member(name, uname, pwd, balance=bal)
-                            success += 1
-                        except Exception:
-                            errors += 1
-        except Exception as e:
-            messagebox.showerror("Import Error", f"Failed to read CSV:\n{e}", parent=self)
+            preview = member_import.import_csv(path, dry_run=True)
+        except OSError as exc:
+            messagebox.showerror("Import Members", f"Could not read the file:\n{exc}",
+                                 parent=self)
             return
-            
+
+        preview_text = member_import.format_report(preview)
+        if preview["format"] == "unknown" or (preview["added"] == 0 and preview["errors"]):
+            messagebox.showerror("Import Members",
+                                 preview_text +
+                                 "\n\nExpected a 'username' column, or a Cyber Cafe Pro "
+                                 "members export.", parent=self)
+            return
+        if preview["added"] == 0:
+            messagebox.showinfo("Import Members", preview_text +
+                                "\n\nNothing new to import.", parent=self)
+            return
+        if not messagebox.askyesno(
+                "Import Members",
+                preview_text + f"\n\nImport {preview['added']} member(s) now?",
+                parent=self):
+            return
+
+        report = member_import.import_csv(path)
         self._load_members()
-        self.app.set_status(f"CSV Import: {success} added, {errors} failed")
-        messagebox.showinfo("Import Complete", f"Successfully added {success} members.\nFailed/Duplicates: {errors}", parent=self)
+        self.after(100, self.app.refresh_revenue)
+        self.app.set_status(f"Imported {report['added']} member(s) from CSV")
+        messagebox.showinfo(
+            "Import Complete",
+            member_import.format_report(report) +
+            ("\n\nTemporary passwords are listed in the member notes — "
+             "reset them on first login." if report.get("temp_passwords") else ""),
+            parent=self)
 
     def _topup(self, member: dict):
         amount = simpledialog.askfloat(

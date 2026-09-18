@@ -5,10 +5,10 @@
 
 import tkinter as tk
 from tkinter import font as tkfont
+from tkinter import messagebox
 import sys
 import os
-import threading
-import time
+import queue
 from datetime import datetime
 from PIL import Image, ImageTk
 
@@ -48,6 +48,12 @@ class AdminApp(tk.Tk):
         super().__init__()
 
         db.init_db()
+
+        # ── Thread-safe UI updates ───────────────────────────
+        # Server threads never touch Tk directly; they post callables
+        # here and the main loop drains them (~50 ms).
+        self._ui_queue = queue.Queue()
+        self._drain_ui_queue()
 
         # ── Window setup ─────────────────────────────────────
         self.title(f"{config.APP_NAME}  v{config.APP_VERSION}  —  Admin Panel")
@@ -417,9 +423,53 @@ class AdminApp(tk.Tk):
             fg=config.COLOR_TEXT_DIM, bg=config.COLOR_BG
         ).place(relx=0.5, rely=0.5, anchor="center")
 
+    # ── Thread-safe UI plumbing ───────────────────────────────
+
+    def post_to_ui(self, func, *args, **kwargs):
+        """Queue a callable to run on the Tk main thread."""
+        self._ui_queue.put((func, args, kwargs))
+
+    def _drain_ui_queue(self):
+        while True:
+            try:
+                func, args, kwargs = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                func(*args, **kwargs)
+            except Exception as exc:                           # noqa: BLE001
+                try:
+                    self.set_status(f"UI error: {exc}")
+                except Exception:                              # noqa: BLE001
+                    pass
+        self.after(50, self._drain_ui_queue)
+
+    # ── Server events ─────────────────────────────────────────
+
+    def on_session_event(self, kind: str, payload: dict):
+        """Called from the server thread for session lifecycle events."""
+        self.post_to_ui(self._handle_session_event, kind, dict(payload or {}))
+
+    def _handle_session_event(self, kind: str, payload: dict):
+        if kind == "settled":
+            self.refresh_revenue()
+            dashboard = getattr(self, "dashboard", None)
+            if dashboard is not None:
+                dashboard.show_receipt(payload)
+            if dashboard is not None:
+                dashboard.on_pc_update(self.server.get_clients_snapshot()
+                                       if self.server else {})
+        elif kind in ("suspended", "recovered", "started", "add_time"):
+            self.refresh_revenue()
+
     # ── Public helpers ────────────────────────────────────────
 
     def set_status(self, msg: str):
+        if str(msg).startswith("SERVER FAILED"):
+            messagebox.showerror("Server error", msg)
+        return self._set_status(msg)
+
+    def _set_status(self, msg: str):
         self.status_msg.set(f"●  {msg}")
 
     def _clear_content(self):
@@ -432,6 +482,7 @@ class AdminApp(tk.Tk):
         self.total_pcs.set(total)
 
     def refresh_revenue(self):
+        """6A — one canonical revenue number (settled sessions only)."""
         self.today_rev.set(db.get_today_revenue())
         self.today_sess.set(db.get_today_sessions())
 
@@ -446,7 +497,17 @@ class AdminApp(tk.Tk):
 
     def _refresh_stats(self):
         self.refresh_revenue()
-        self.after(10_000, self._refresh_stats)   # every 10 seconds
+        if self.server:
+            try:
+                self.dashboard_update_from_server()
+            except Exception:                                  # noqa: BLE001
+                pass
+        self.after(5_000, self._refresh_stats)
+
+    def dashboard_update_from_server(self):
+        """Keep the grid honest even when no client event arrived."""
+        if self.server and getattr(self, "dashboard", None) is not None:
+            self.dashboard.on_pc_update(self.server.get_clients_snapshot())
 
     # ── Close ─────────────────────────────────────────────────
 
