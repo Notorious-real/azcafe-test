@@ -15,6 +15,7 @@ sys.path.insert(0, ROOT_DIR)
 
 import config
 import database as db
+from server import printer
 
 
 class StartSessionDialog(tk.Toplevel):
@@ -578,9 +579,10 @@ class StopSessionDialog(tk.Toplevel):
         # ── Receipt button ────────────────────────────────────
         tk.Button(
             body,
-            text="🖨  View Receipt",
+            text="🖨  Preview Receipt",
             command=lambda: self._show_receipt(user, used_mins,
-                                               used_secs_r, actual_amt),
+                                               used_secs_r, actual_amt,
+                                               total_mins, amount),
             bg=config.COLOR_BG3,
             fg=config.COLOR_TEXT_DIM,
             font=("Segoe UI", 9),
@@ -621,9 +623,23 @@ class StopSessionDialog(tk.Toplevel):
                         actual_amount=self._actual_amt)
         self.destroy()
 
-    def _show_receipt(self, user, used_mins, used_secs_r, amount):
-        ReceiptWindow(self, self.pc_name, user,
-                      used_mins, used_secs_r, amount)
+    def _show_receipt(self, user, used_mins, used_secs_r, amount,
+                      total_mins=0, prepaid=None):
+        """Estimate before the stop is confirmed; the final receipt comes
+        from the server once the session is settled."""
+        prepaid = amount if prepaid is None else prepaid
+        ReceiptWindow(self, {
+            "session_id": self.session_info.get("session_id", "-"),
+            "pc_name": self.pc_name,
+            "user": user,
+            "payment_type": self._payment_var.get(),
+            "booked_mins": total_mins,
+            "used_secs": used_mins * 60 + used_secs_r,
+            "prepaid": prepaid,
+            "charged": amount,
+            "refund": max(0.0, float(prepaid) - float(amount)),
+            "balance_left": None,
+        })
 
 
 # ============================================================
@@ -632,93 +648,379 @@ class StopSessionDialog(tk.Toplevel):
 
 class ReceiptWindow(tk.Toplevel):
     """
-    Simple receipt shown on screen.
-    Can be printed via system print dialog.
+    On-screen receipt for a settled session (2F / 7B).
+
+    Takes the payload produced by AZCafeServer._settle so the numbers are
+    the server's, not a guess, and can send the same text to the printer.
     """
 
-    def __init__(self, parent, pc_name, user,
-                 used_mins, used_secs_r, amount):
+    def __init__(self, parent, payload: dict):
         super().__init__(parent)
+        self.payload = payload or {}
         self.title("Receipt")
         self.configure(bg="white")
         self.resizable(False, False)
 
-        w, h = 300, 400
-        self.geometry(f"{w}x{h}")
+        width, height = 320, 470
+        self.geometry(f"{width}x{height}")
         self.update_idletasks()
-        x = (self.winfo_screenwidth()  - w) // 2
-        y = (self.winfo_screenheight() - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
+        x = (self.winfo_screenwidth() - width) // 2
+        y = (self.winfo_screenheight() - height) // 2
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self._build()
 
-        self._build(pc_name, user, used_mins, used_secs_r, amount)
-
-    def _build(self, pc_name, user, used_mins, used_secs_r, amount):
+    def _build(self):
         from datetime import datetime
-        now = datetime.now().strftime("%d-%m-%Y  %I:%M %p")
 
+        payload = self.payload
+        shop = db.get_setting("shop_name", config.APP_NAME)
         pad = tk.Frame(self, bg="white", padx=20, pady=16)
         pad.pack(fill=tk.BOTH, expand=True)
 
-        def _center(text, font_size=10, bold=False, color="black"):
-            w = "bold" if bold else "normal"
-            tk.Label(pad, text=text,
-                     font=("Courier", font_size, w),
-                     fg=color, bg="white",
-                     justify=tk.CENTER).pack()
+        def _center(text, size=10, bold=False, color="black"):
+            tk.Label(pad, text=text, font=("Courier", size, "bold" if bold else "normal"),
+                     fg=color, bg="white", justify=tk.CENTER).pack()
 
         def _divider():
-            tk.Label(pad, text="-" * 34,
-                     font=("Courier", 9),
+            tk.Label(pad, text="-" * 34, font=("Courier", 9),
                      fg="gray", bg="white").pack()
 
-        shop = db.get_setting("shop_name", config.APP_NAME)
-
-        _center(shop, 14, bold=True)
-        _center("GAMING ZONE", 9)
-        _center(now, 9)
-        _divider()
-        _center("RECEIPT", 11, bold=True)
-        _divider()
-
-        def _row(label, value):
+        def _row(label, value, color="black"):
             row = tk.Frame(pad, bg="white")
             row.pack(fill=tk.X)
-            tk.Label(row, text=label,
-                     font=("Courier", 9),
-                     fg="black", bg="white",
-                     anchor="w").pack(side=tk.LEFT)
-            tk.Label(row, text=value,
-                     font=("Courier", 9),
-                     fg="black", bg="white",
-                     anchor="e").pack(side=tk.RIGHT)
+            tk.Label(row, text=label, font=("Courier", 9), fg="black",
+                     bg="white", anchor="w").pack(side=tk.LEFT)
+            tk.Label(row, text=value, font=("Courier", 9), fg=color,
+                     bg="white", anchor="e").pack(side=tk.RIGHT)
 
-        _row("Customer:", user)
-        _row("PC:", pc_name)
-        _row("Time Used:", f"{used_mins}m {used_secs_r:02d}s")
-        _divider()
-        _row("TOTAL:", f"{config.CURRENCY} {amount:.0f}")
-        _divider()
-        _center("Thank you!", 10, bold=True)
-        _center("Please visit again", 9)
+        used = int(payload.get("used_secs") or 0)
+        hours, rest = divmod(used, 3600)
+        minutes, seconds = divmod(rest, 60)
+        charged = float(payload.get("charged") or 0)
+        refund = float(payload.get("refund") or 0)
+        prepaid = float(payload.get("prepaid") or 0)
 
-        tk.Button(
-            pad,
-            text="🖨  Print",
-            command=self._print,
-            bg=config.COLOR_RED, fg="white",
-            font=("Segoe UI", 9, "bold"),
-            relief=tk.FLAT, padx=16, pady=6,
-            cursor="hand2", bd=0
-        ).pack(pady=(16, 0))
+        _center(shop, 14, bold=True)
+        _center("SESSION RECEIPT", 11, bold=True)
+        _center(datetime.now().strftime("%d-%m-%Y  %I:%M %p"), 9)
+        _divider()
+        _row("Receipt #", str(payload.get("session_id", "-")))
+        _row("PC:", str(payload.get("pc_name", "-")))
+        _row("Customer:", str(payload.get("user", "Guest")))
+        _row("Payment:", str(payload.get("payment_type", "cash")).title())
+        _divider()
+        _row("Time booked:", f"{payload.get('booked_mins', 0)} min")
+        _row("Time used:", f"{hours}h {minutes:02d}m {seconds:02d}s")
+        _divider()
+        _row("Prepaid:", f"{config.CURRENCY} {prepaid:.0f}")
+        _row("TOTAL:", f"{config.CURRENCY} {charged:.0f}", config.COLOR_RED)
+        if refund > 0:
+            _row("Refund:", f"{config.CURRENCY} {refund:.0f}", "#008000")
+        balance_left = payload.get("balance_left")
+        if balance_left is not None:
+            _row("Balance left:", f"{config.CURRENCY} {float(balance_left):.0f}")
+        _divider()
+        _center("Thank you!  Please visit again", 9, bold=True)
+
+        buttons = tk.Frame(pad, bg="white")
+        buttons.pack(pady=(14, 0))
+        tk.Button(buttons, text="🖨  Print", command=self._print,
+                  bg=config.COLOR_RED, fg="white", font=("Segoe UI", 9, "bold"),
+                  relief=tk.FLAT, padx=14, pady=6, cursor="hand2", bd=0).pack(side=tk.LEFT)
+        tk.Button(buttons, text="Close", command=self.destroy,
+                  bg="#dddddd", fg="black", font=("Segoe UI", 9),
+                  relief=tk.FLAT, padx=14, pady=6, cursor="hand2", bd=0).pack(side=tk.LEFT, padx=(8, 0))
 
     def _print(self):
-        """
-        Print via Windows notepad (simplest cross-version approach).
-        For thermal printer support — add in Phase 7.
-        """
-        messagebox.showinfo(
-            "Print",
-            "Thermal printer support coming in Phase 7.\n\n"
-            "For now, take a screenshot of this receipt.",
-            parent=self
-        )
+        shop = db.get_setting("shop_name", config.APP_NAME)
+        printer_name = db.get_setting("receipt_printer", "")
+        ok, message = printer.print_receipt(self.payload, shop_name=shop,
+                                            currency=config.CURRENCY,
+                                            printer_name=printer_name)
+        if ok:
+            messagebox.showinfo("Receipt", message, parent=self)
+        else:
+            messagebox.showwarning("Receipt", message, parent=self)
+
+
+# ============================================================
+#  Add Time dialog — Phase 5D
+#  Time is charged for and persisted; it is no longer memory-only.
+# ============================================================
+
+class AddTimeDialog(tk.Toplevel):
+
+    def __init__(self, parent, pc_name: str, rate_per_hour: float,
+                 member_id=None, payment_type: str = "cash", on_add=None):
+        super().__init__(parent)
+        self.pc_name = pc_name
+        self.rate_per_hour = float(rate_per_hour or 0)
+        self.member_id = member_id
+        self.on_add = on_add or (lambda mins, amount, pay: None)
+
+        self.title(f"Add Time — {pc_name}")
+        self.configure(bg=config.COLOR_BG)
+        self.resizable(False, False)
+        self.grab_set()
+
+        width, height = 380, 420
+        self.geometry(f"{width}x{height}")
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() - width) // 2
+        y = (self.winfo_screenheight() - height) // 2
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+        self._mins_var = tk.StringVar(value="30")
+        self._amount_var = tk.StringVar(value="")
+        self._payment_var = tk.StringVar(value=payment_type or "cash")
+        self._build()
+        self._recalc()
+
+    def _build(self):
+        tk.Frame(self, bg=config.COLOR_RED, height=3).pack(fill=tk.X)
+        tk.Label(self, text=f"  ⏱  Add Time  —  {self.pc_name}",
+                 font=("Segoe UI", 11, "bold"), fg=config.COLOR_TEXT,
+                 bg=config.COLOR_BG2, anchor="w", pady=10).pack(fill=tk.X)
+        tk.Frame(self, bg=config.COLOR_BORDER, height=1).pack(fill=tk.X)
+
+        body = tk.Frame(self, bg=config.COLOR_BG, padx=22, pady=14)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(body, text=f"Rate: {config.CURRENCY} {self.rate_per_hour:.0f} / hour",
+                 font=("Segoe UI", 9), fg=config.COLOR_TEXT_DIM,
+                 bg=config.COLOR_BG, anchor="w").pack(fill=tk.X)
+
+        tk.Label(body, text="Extra minutes", font=("Segoe UI", 9),
+                 fg=config.COLOR_TEXT_DIM, bg=config.COLOR_BG,
+                 anchor="w").pack(fill=tk.X, pady=(12, 2))
+        entry = tk.Entry(body, textvariable=self._mins_var, font=("Segoe UI", 11),
+                         bg=config.COLOR_BG3, fg=config.COLOR_TEXT,
+                         insertbackground=config.COLOR_TEXT, relief=tk.FLAT, bd=5)
+        entry.pack(fill=tk.X)
+        entry.bind("<KeyRelease>", lambda e: self._recalc())
+        entry.focus_set()
+
+        quick = tk.Frame(body, bg=config.COLOR_BG)
+        quick.pack(fill=tk.X, pady=(6, 0))
+        for minutes in (15, 30, 60, 120):
+            tk.Button(quick, text=f"+{minutes}m",
+                      command=lambda m=minutes: (self._mins_var.set(str(m)), self._recalc()),
+                      bg=config.COLOR_BG3, fg=config.COLOR_TEXT_DIM,
+                      font=("Segoe UI", 8), relief=tk.FLAT, padx=8, pady=3,
+                      cursor="hand2", bd=0,
+                      activebackground=config.COLOR_RED,
+                      activeforeground=config.COLOR_TEXT).pack(side=tk.LEFT, padx=2)
+
+        tk.Label(body, text=f"Amount ({config.CURRENCY})", font=("Segoe UI", 9),
+                 fg=config.COLOR_TEXT_DIM, bg=config.COLOR_BG,
+                 anchor="w").pack(fill=tk.X, pady=(12, 2))
+        amount_entry = tk.Entry(body, textvariable=self._amount_var,
+                                font=("Segoe UI", 11), bg=config.COLOR_BG3,
+                                fg=config.COLOR_TEXT, insertbackground=config.COLOR_TEXT,
+                                relief=tk.FLAT, bd=5)
+        amount_entry.pack(fill=tk.X)
+
+        tk.Label(body, text="Payment", font=("Segoe UI", 9),
+                 fg=config.COLOR_TEXT_DIM, bg=config.COLOR_BG,
+                 anchor="w").pack(fill=tk.X, pady=(12, 2))
+        pay_row = tk.Frame(body, bg=config.COLOR_BG)
+        pay_row.pack(fill=tk.X)
+        options = [("Cash", "cash")]
+        if self.member_id:
+            options.append(("Member balance", "balance"))
+        for text, value in options:
+            tk.Radiobutton(pay_row, text=text, variable=self._payment_var,
+                           value=value, bg=config.COLOR_BG, fg=config.COLOR_TEXT,
+                           selectcolor=config.COLOR_BG3, activebackground=config.COLOR_BG,
+                           font=("Segoe UI", 9), cursor="hand2").pack(side=tk.LEFT, padx=(0, 12))
+
+        self._note_var = tk.StringVar()
+        tk.Label(body, textvariable=self._note_var, font=("Segoe UI", 8),
+                 fg=config.COLOR_YELLOW, bg=config.COLOR_BG, anchor="w",
+                 wraplength=320, justify=tk.LEFT).pack(fill=tk.X, pady=(10, 0))
+
+        buttons = tk.Frame(self, bg=config.COLOR_BG2, pady=10, padx=20)
+        buttons.pack(fill=tk.X)
+        tk.Button(buttons, text="➕  Add Time", command=self._confirm,
+                  bg=config.COLOR_RED, fg=config.COLOR_TEXT,
+                  font=("Segoe UI", 10, "bold"), relief=tk.FLAT,
+                  padx=18, pady=7, cursor="hand2", bd=0,
+                  activebackground=config.COLOR_RED_DARK,
+                  activeforeground=config.COLOR_TEXT).pack(side=tk.RIGHT)
+        tk.Button(buttons, text="Cancel", command=self.destroy,
+                  bg=config.COLOR_BG3, fg=config.COLOR_TEXT_DIM,
+                  font=("Segoe UI", 9), relief=tk.FLAT, padx=14, pady=7,
+                  cursor="hand2", bd=0).pack(side=tk.RIGHT, padx=(0, 8))
+
+    def _recalc(self):
+        try:
+            minutes = float(self._mins_var.get() or 0)
+        except ValueError:
+            minutes = 0
+        amount = round((minutes / 60.0) * self.rate_per_hour, 2)
+        self._amount_var.set(f"{amount:.0f}")
+        if self.member_id and self._payment_var.get() == "balance":
+            member = db.get_member_by_id(self.member_id)
+            if member:
+                self._note_var.set(f"Member balance: {config.CURRENCY} "
+                                   f"{member['balance']:.0f}")
+        else:
+            self._note_var.set("Cash is collected at the counter; the session "
+                               "and the ledger are updated either way.")
+
+    def _confirm(self):
+        try:
+            minutes = int(float(self._mins_var.get()))
+        except ValueError:
+            messagebox.showerror("Error", "Enter a valid number of minutes.", parent=self)
+            return
+        if minutes <= 0:
+            messagebox.showerror("Error", "Minutes must be at least 1.", parent=self)
+            return
+        try:
+            amount = round(float(self._amount_var.get() or 0), 2)
+        except ValueError:
+            messagebox.showerror("Error", "Enter a valid amount.", parent=self)
+            return
+        if amount < 0:
+            messagebox.showerror("Error", "Amount cannot be negative.", parent=self)
+            return
+        self.on_add(minutes, amount, self._payment_var.get())
+        self.destroy()
+
+
+# ============================================================
+#  Manage Groups dialog — Phase 5F
+#  Create, rename and delete groups (previously you could only
+#  assign a name that already existed somewhere).
+# ============================================================
+
+class ManageGroupsDialog(tk.Toplevel):
+
+    def __init__(self, parent, on_changed=None):
+        super().__init__(parent)
+        self.on_changed = on_changed or (lambda: None)
+        self.title("Manage PC Groups")
+        self.configure(bg=config.COLOR_BG)
+        self.resizable(False, False)
+        self.grab_set()
+
+        width, height = 460, 480
+        self.geometry(f"{width}x{height}")
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() - width) // 2
+        y = (self.winfo_screenheight() - height) // 2
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+        self._new_var = tk.StringVar()
+        self._list = None
+        self._build()
+        self._refresh()
+
+    def _build(self):
+        tk.Frame(self, bg=config.COLOR_RED, height=3).pack(fill=tk.X)
+        tk.Label(self, text="  📁  PC Groups", font=("Segoe UI", 11, "bold"),
+                 fg=config.COLOR_TEXT, bg=config.COLOR_BG2, anchor="w",
+                 pady=10).pack(fill=tk.X)
+        tk.Frame(self, bg=config.COLOR_BORDER, height=1).pack(fill=tk.X)
+
+        body = tk.Frame(self, bg=config.COLOR_BG, padx=20, pady=12)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        self._list = tk.Listbox(body, font=("Segoe UI", 10),
+                                bg=config.COLOR_BG3, fg=config.COLOR_TEXT,
+                                selectbackground=config.COLOR_RED,
+                                selectforeground=config.COLOR_TEXT,
+                                relief=tk.FLAT, bd=0, height=10)
+        self._list.pack(fill=tk.BOTH, expand=True)
+
+        row = tk.Frame(body, bg=config.COLOR_BG)
+        row.pack(fill=tk.X, pady=(12, 0))
+        tk.Label(row, text="New group", font=("Segoe UI", 9),
+                 fg=config.COLOR_TEXT_DIM, bg=config.COLOR_BG).pack(side=tk.LEFT)
+        entry = tk.Entry(row, textvariable=self._new_var, font=("Segoe UI", 10),
+                         bg=config.COLOR_BG3, fg=config.COLOR_TEXT,
+                         insertbackground=config.COLOR_TEXT, relief=tk.FLAT, bd=4)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        entry.bind("<Return>", lambda e: self._create())
+        tk.Button(row, text="Create", command=self._create,
+                  bg=config.COLOR_BG3, fg=config.COLOR_TEXT, font=("Segoe UI", 9),
+                  relief=tk.FLAT, padx=10, pady=4, cursor="hand2", bd=0,
+                  activebackground=config.COLOR_RED,
+                  activeforeground=config.COLOR_TEXT).pack(side=tk.LEFT)
+
+        buttons = tk.Frame(body, bg=config.COLOR_BG)
+        buttons.pack(fill=tk.X, pady=(12, 0))
+        tk.Button(buttons, text="✏️  Rename", command=self._rename,
+                  bg=config.COLOR_BG3, fg=config.COLOR_TEXT, font=("Segoe UI", 9),
+                  relief=tk.FLAT, padx=12, pady=5, cursor="hand2", bd=0,
+                  activebackground=config.COLOR_RED,
+                  activeforeground=config.COLOR_TEXT).pack(side=tk.LEFT)
+        tk.Button(buttons, text="🗑  Delete", command=self._delete,
+                  bg=config.COLOR_BG3, fg=config.COLOR_RED_BRIGHT,
+                  font=("Segoe UI", 9), relief=tk.FLAT, padx=12, pady=5,
+                  cursor="hand2", bd=0).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Button(buttons, text="Close", command=self.destroy,
+                  bg=config.COLOR_RED, fg=config.COLOR_TEXT,
+                  font=("Segoe UI", 9, "bold"), relief=tk.FLAT, padx=14, pady=5,
+                  cursor="hand2", bd=0,
+                  activebackground=config.COLOR_RED_DARK,
+                  activeforeground=config.COLOR_TEXT).pack(side=tk.RIGHT)
+
+        tk.Label(body, text="Deleting a group moves its PCs back to “Default”.",
+                 font=("Segoe UI", 8), fg=config.COLOR_TEXT_DIM,
+                 bg=config.COLOR_BG, anchor="w").pack(fill=tk.X, pady=(10, 0))
+
+    def _selected_group(self):
+        selection = self._list.curselection()
+        if not selection:
+            return None
+        return self._list.get(selection[0]).split("  (")[0].strip()
+
+    def _refresh(self):
+        self._list.delete(0, tk.END)
+        counts = db.get_group_counts()
+        for group in db.get_all_pc_groups():
+            self._list.insert(tk.END, f"{group}  ({counts.get(group, 0)} PCs)")
+
+    def _create(self):
+        name = self._new_var.get().strip()
+        if not name:
+            return
+        db.create_pc_group(name)
+        self._new_var.set("")
+        self._refresh()
+        self.on_changed()
+
+    def _rename(self):
+        old = self._selected_group()
+        if not old:
+            messagebox.showinfo("Groups", "Select a group first.", parent=self)
+            return
+        from tkinter import simpledialog
+        new = simpledialog.askstring("Rename group", f"New name for “{old}”:",
+                                     parent=self)
+        if not new or not new.strip() or new.strip() == old:
+            return
+        moved = db.rename_pc_group(old, new.strip())
+        self._refresh()
+        self.on_changed()
+        messagebox.showinfo("Groups", f"Renamed to “{new.strip()}” ({moved} PCs).",
+                            parent=self)
+
+    def _delete(self):
+        group = self._selected_group()
+        if not group:
+            messagebox.showinfo("Groups", "Select a group first.", parent=self)
+            return
+        if group == "Default":
+            messagebox.showinfo("Groups", "The Default group cannot be deleted.",
+                                parent=self)
+            return
+        if not messagebox.askyesno("Delete group",
+                                   f"Delete “{group}”?\nIts PCs move to Default.",
+                                   parent=self):
+            return
+        db.delete_pc_group(group)
+        self._refresh()
+        self.on_changed()

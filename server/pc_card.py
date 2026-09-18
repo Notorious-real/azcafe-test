@@ -4,8 +4,6 @@
 # ============================================================
 
 import tkinter as tk
-from tkinter import font as tkfont
-import time
 import sys
 import os
 
@@ -63,6 +61,8 @@ class PCCard(tk.Frame):
         self.session_user    = ""
         self.remaining_secs  = 0
         self.paused          = False
+        self.suspended       = False
+        self.display_name    = pc_name
 
         # Drag state
         self._drag_x = 0
@@ -278,14 +278,28 @@ class PCCard(tk.Frame):
             label="✏️  Rename PC",
             command=lambda: self.on_command(self.pc_name, "rename")
         )
+        menu.add_command(
+            label="🧹  Force close stale session",
+            command=lambda: self.on_command(self.pc_name, "force_close")
+        )
 
-        # Disable all options if offline
+        # Offline cards keep the maintenance options (rename, groups, plan,
+        # force-close) but lose the live session/power commands.
         if st == config.STATUS_OFFLINE:
             for i in range(menu.index("end") + 1):
                 try:
                     menu.entryconfig(i, state=tk.DISABLED)
                 except tk.TclError:
                     pass
+            if self.suspended:
+                for index, opts in (
+                        (menu.index("🧹  Force close stale session"), {}),
+                        ):
+                    if index is not None:
+                        try:
+                            menu.entryconfig(index, state=tk.NORMAL)
+                        except tk.TclError:
+                            pass
 
         menu.tk_popup(e.x_root, e.y_root)
 
@@ -298,13 +312,19 @@ class PCCard(tk.Frame):
 
     # ── Update ────────────────────────────────────────────────
 
+    def set_display_name(self, name: str):
+        self.display_name = name or self.pc_name
+        self._name_lbl.config(text=self.display_name)
+
     def update_data(self, status: str, user: str = "",
-                    remaining_secs: int = 0, paused: bool = False):
-        """Called by dashboard when server sends an update."""
+                    remaining_secs: int = 0, paused: bool = False,
+                    suspended: bool = False):
+        """Called by dashboard when the server sends an update."""
         self.status         = status
         self.session_user   = user
         self.remaining_secs = remaining_secs
         self.paused         = paused
+        self.suspended      = suspended
 
         color  = self.STATUS_COLORS.get(status, "#444444")
         bg     = self.STATUS_BG.get(status, config.COLOR_BG2)
@@ -323,11 +343,13 @@ class PCCard(tk.Frame):
         # Dot color
         self._dot.config(fg=color, bg=bg)
 
-        # Status label
-        self._status_lbl.config(
-            text=status,
-            fg=color, bg=bg
-        )
+        # Status label — a PC that dropped mid-session says so
+        label = status
+        status_color = color
+        if status == config.STATUS_OFFLINE and suspended:
+            label = "SESSION HELD"
+            status_color = config.COLOR_YELLOW
+        self._status_lbl.config(text=label, fg=status_color, bg=bg)
 
         # User
         self._user_lbl.config(
@@ -350,10 +372,11 @@ class PCCard(tk.Frame):
         self._update_timer_display()
 
     def tick(self):
-        """Called every second by dashboard timer — decrements local display."""
+        """
+        Called every second by the dashboard. Only refreshes the hints —
+        the countdown itself comes from the server (one clock, one truth).
+        """
         if self.status == config.STATUS_ACTIVE and not self.paused:
-            if self.remaining_secs > 0:
-                self.remaining_secs -= 1
             self._update_timer_display()
 
             secs = self.remaining_secs
@@ -376,6 +399,11 @@ class PCCard(tk.Frame):
                     text="Right-click for options",
                     fg="#333333"
                 )
+        elif self.status == config.STATUS_OFFLINE and self.suspended:
+            self._hint_lbl.config(
+                text="Paid time held — resumes on reconnect",
+                fg=config.COLOR_YELLOW
+            )
 
     def _update_timer_display(self):
         secs  = max(0, self.remaining_secs)

@@ -17,6 +17,7 @@ sys.path.insert(0, ROOT_DIR)
 
 import config
 import database as db
+from server import exporters
 
 
 class ReportsPanel(tk.Frame):
@@ -55,10 +56,21 @@ class ReportsPanel(tk.Frame):
                  fg=config.COLOR_RED,
                  bg=config.COLOR_BG2).pack(side=tk.LEFT, padx=8)
 
-        # Export buttons (Phase 6E)
+        # Export buttons (Phase 6E) — CSV, real XLSX, real PDF
         tk.Button(
-            bar, text="📄  Export PDF/HTML",
-            command=self._export_html_pdf,
+            bar, text="📄  Export PDF",
+            command=self._export_pdf,
+            font=("Segoe UI", 8, "bold"),
+            bg=config.COLOR_BG3, fg=config.COLOR_TEXT,
+            relief=tk.FLAT, padx=10, pady=4,
+            cursor="hand2", bd=0,
+            activebackground=config.COLOR_RED,
+            activeforeground=config.COLOR_TEXT
+        ).pack(side=tk.RIGHT, padx=4, pady=5)
+
+        tk.Button(
+            bar, text="📊  Export Excel",
+            command=self._export_xlsx,
             font=("Segoe UI", 8, "bold"),
             bg=config.COLOR_BG3, fg=config.COLOR_TEXT,
             relief=tk.FLAT, padx=10, pady=4,
@@ -89,6 +101,7 @@ class ReportsPanel(tk.Frame):
             ("charts",      "📊  Revenue Chart"),
             ("per_pc",      "🖥️  Per PC"),
             ("top_members", "👥  Top Members"),
+            ("cash_log",    "🧾  Cash Log"),
         ]
         for key, label in tabs:
             btn = tk.Label(
@@ -132,6 +145,8 @@ class ReportsPanel(tk.Frame):
             self._build_per_pc()
         elif key == "top_members":
             self._build_top_members()
+        elif key == "cash_log":
+            self._build_cash_log()
 
     # ── Today Tab ─────────────────────────────────────────────
 
@@ -141,9 +156,16 @@ class ReportsPanel(tk.Frame):
 
     def _build_day_report(self, parent, date_str: str, title: str):
         sessions = db.get_sessions_by_date(date_str)
-        revenue  = sum(s["amount_charged"] for s in sessions)
-        total    = len(sessions)
-        active   = sum(1 for s in sessions if s["status"] == "active")
+        # 6A: one definition of revenue everywhere — settled sessions only.
+        totals   = db.get_day_totals(date_str)
+        revenue  = totals["revenue"]
+        open_amt = totals["open_amount"]
+        total    = totals["completed_sessions"]
+        active   = totals["open_sessions"]
+
+        # Keep the export buttons pointing at the day being viewed
+        self._export_date = date_str
+        self._export_sessions = sessions
 
         # ── Summary cards ─────────────────────────────────────
         summary = tk.Frame(parent, bg=config.COLOR_BG, padx=16, pady=12)
@@ -152,9 +174,9 @@ class ReportsPanel(tk.Frame):
         stats = [
             ("TOTAL REVENUE",  f"{config.CURRENCY} {revenue:.0f}", config.COLOR_RED_BRIGHT),
             ("SESSIONS",       str(total),                         config.COLOR_TEXT),
-            ("ACTIVE NOW",     str(active),                        config.COLOR_GREEN),
+            (f"OPEN TABS ({active})", f"{config.CURRENCY} {open_amt:.0f}", config.COLOR_GREEN),
             ("AVG PER SESSION",
-             f"{config.CURRENCY} {revenue/total:.0f}" if total else "—",
+             f"{config.CURRENCY} {totals['avg_per_session']:.0f}" if total else "—",
              config.COLOR_YELLOW),
         ]
         for label, value, color in stats:
@@ -511,14 +533,14 @@ class ReportsPanel(tk.Frame):
                 d = (now - timedelta(days=29 - i)).strftime("%Y-%m-%d")
                 d_short = datetime.strptime(d, "%Y-%m-%d").strftime("%d %b")
                 items.append((d_short, data_dict.get(d, 0.0)))
-            title = f"Past 30 Days Daily Revenue"
+            title = "Past 30 Days Daily Revenue"
 
         else: # monthly
             raw_data = db.get_monthly_revenue_breakdown(6)
             items = [(r["month"], r["revenue"]) for r in raw_data]
             if not items:
                 items = [(now.strftime("%Y-%m"), 0.0)]
-            title = f"Past 6 Months Revenue"
+            title = "Past 6 Months Revenue"
 
         total_rev = sum(amt for _, amt in items)
         max_amt = max([amt for _, amt in items] + [100.0])
@@ -587,160 +609,163 @@ class ReportsPanel(tk.Frame):
                 canvas.create_text(x_center, height - pad_bottom + 14, text=label,
                                    fill=config.COLOR_TEXT_DIM, font=("Segoe UI", 7))
 
-    # ── Export CSV ────────────────────────────────────────────
+    # ── Exports (6E) ──────────────────────────────────────────
+
+    def _export_context(self):
+        """Sessions + metadata for whichever day the report is showing."""
+        from tkinter import filedialog
+        date_str = getattr(self, "_export_date", None) or datetime.now().strftime("%Y-%m-%d")
+        sessions = getattr(self, "_export_sessions", None)
+        if sessions is None:
+            sessions = db.get_sessions_by_date(date_str)
+        if not sessions:
+            messagebox.showinfo("Export", f"No sessions on {date_str}.", parent=self)
+            return None, None, None, None
+
+        shop = db.get_setting("shop_name", config.APP_NAME)
+        title = ("Today's report" if date_str == datetime.now().strftime("%Y-%m-%d")
+                 else f"Session report {date_str}")
+
+        # Sessions only store member_id — attach names so exports read well.
+        try:
+            names = {m["id"]: m["name"] for m in db.get_all_members()}
+        except Exception:                                      # noqa: BLE001
+            names = {}
+        enriched = []
+        for session in sessions:
+            row = dict(session)
+            if not row.get("member_name") and row.get("member_id") in names:
+                row["member_name"] = names[row["member_id"]]
+            enriched.append(row)
+
+        meta = exporters.default_meta(shop, title, date_str, config.CURRENCY, enriched)
+        return date_str, enriched, meta, filedialog
 
     def _export_csv(self):
-        from tkinter import filedialog
-        today    = datetime.now().strftime("%Y-%m-%d")
-        sessions = db.get_sessions_by_date(today)
-
+        date_str, sessions, meta, filedialog = self._export_context()
         if not sessions:
-            messagebox.showinfo("Export", "No sessions today to export.", parent=self)
             return
-
         path = filedialog.asksaveasfilename(
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv")],
-            initialfile=f"azcafe_report_{today}.csv",
-            parent=self
-        )
+            initialfile=exporters.suggested_name("report", date_str, "csv"),
+            parent=self)
         if not path:
             return
-
-        import csv
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Time", "PC", "Customer", "Duration(mins)", "Amount", "Payment", "Status"])
-            for s in sessions:
-                user = (s.get("guest_name") or f"Member #{s.get('member_id','?')}")
-                writer.writerow([
-                    s["start_time"][11:16],
-                    s["pc_name"],
-                    user,
-                    s["duration_mins"],
-                    f"{s['amount_charged']:.0f}",
-                    s["payment_type"],
-                    s["status"]
-                ])
-
+        exporters.export_csv(sessions, exporters.ensure_extension(path, "csv"), meta)
+        self.app.set_status(f"CSV exported: {path}")
         messagebox.showinfo("Export", f"Saved to:\n{path}", parent=self)
-        self.app.set_status(f"Report exported: {path}")
 
-    # ── Export HTML / Printable PDF (Phase 6E) ────────────────
-
-    def _export_html_pdf(self):
-        """
-        Phase 6E — Export a clean, styled HTML report with print CSS
-        that opens directly in any browser and can be saved as PDF via Ctrl+P.
-        """
-        from tkinter import filedialog
-        import webbrowser
-
-        today = datetime.now().strftime("%Y-%m-%d")
-        sessions = db.get_sessions_by_date(today)
-
+    def _export_xlsx(self):
+        date_str, sessions, meta, filedialog = self._export_context()
         if not sessions:
-            messagebox.showinfo("Export", "No sessions found today to export.", parent=self)
             return
-
         path = filedialog.asksaveasfilename(
-            defaultextension=".html",
-            filetypes=[("HTML / Printable PDF", "*.html"), ("All files", "*.*")],
-            initialfile=f"azcafe_report_{today}.html",
-            parent=self
-        )
+            defaultextension=".xlsx",
+            filetypes=[("Excel workbook", "*.xlsx")],
+            initialfile=exporters.suggested_name("report", date_str, "xlsx"),
+            parent=self)
         if not path:
             return
+        try:
+            exporters.export_xlsx(sessions, exporters.ensure_extension(path, "xlsx"), meta)
+        except OSError as exc:
+            messagebox.showerror("Export", f"Could not write the workbook:\n{exc}",
+                                 parent=self)
+            return
+        self.app.set_status(f"Excel workbook exported: {path}")
+        messagebox.showinfo("Export", f"Saved to:\n{path}", parent=self)
 
-        total_rev = sum(s["amount_charged"] for s in sessions)
-        total_sessions = len(sessions)
+    def _export_pdf(self):
+        date_str, sessions, meta, filedialog = self._export_context()
+        if not sessions:
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF document", "*.pdf")],
+            initialfile=exporters.suggested_name("report", date_str, "pdf"),
+            parent=self)
+        if not path:
+            return
+        try:
+            exporters.export_pdf(sessions, exporters.ensure_extension(path, "pdf"), meta)
+        except OSError as exc:
+            messagebox.showerror("Export", f"Could not write the PDF:\n{exc}", parent=self)
+            return
+        self.app.set_status(f"PDF exported: {path}")
+        if messagebox.askyesno("Export", f"Saved to:\n{path}\n\nOpen it now?", parent=self):
+            try:
+                os.startfile(path)                             # type: ignore[attr-defined]
+            except Exception:                                  # noqa: BLE001
+                pass
 
-        rows_html = ""
-        for s in sessions:
-            user = s.get("guest_name") or f"Member #{s.get('member_id','?')}"
-            time_str = s["start_time"][11:16] if s["start_time"] else "—"
-            rows_html += f"""
-            <tr>
-                <td>{time_str}</td>
-                <td><b>{s['pc_name']}</b></td>
-                <td>{user}</td>
-                <td>{s['duration_mins']} mins</td>
-                <td style="color:#e02424; font-weight:bold;">{config.CURRENCY} {s['amount_charged']:.0f}</td>
-                <td>{s['payment_type'].capitalize()}</td>
-                <td><span class="badge">{s['status'].upper()}</span></td>
-            </tr>
-            """
+    # ── Cash log tab (new) ───────────────────────────────────
 
-        html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>AZ Cafe Report - {today}</title>
-    <style>
-        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 30px; background: #fff; color: #222; }}
-        .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #c8102e; padding-bottom: 15px; margin-bottom: 20px; }}
-        h1 {{ margin: 0; color: #c8102e; }}
-        .stats-grid {{ display: flex; gap: 20px; margin-bottom: 25px; }}
-        .card {{ background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 6px; padding: 15px; flex: 1; }}
-        .card h3 {{ margin: 0 0 8px 0; font-size: 13px; color: #6c757d; text-transform: uppercase; }}
-        .card .value {{ font-size: 24px; font-weight: bold; color: #111; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
-        th, td {{ padding: 10px 12px; border-bottom: 1px solid #dee2e6; text-align: left; font-size: 14px; }}
-        th {{ background: #f1f3f5; color: #495057; font-weight: 600; }}
-        .badge {{ background: #e9ecef; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }}
-        @media print {{
-            .no-print {{ display: none; }}
-            body {{ margin: 0; }}
-        }}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div>
-            <h1>AZ CAFE — DAILY SESSION REPORT</h1>
-            <p style="margin: 4px 0 0 0; color: #6c757d;">Generated on {today} | Gaming Center Management System</p>
-        </div>
-        <button class="no-print" onclick="window.print()" style="padding: 10px 18px; background: #c8102e; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">Print / Save as PDF</button>
-    </div>
+    def _build_cash_log(self):
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        entries = db.get_cash_log(date_str)
+        totals = db.get_transaction_totals(date_str)
 
-    <div class="stats-grid">
-        <div class="card">
-            <h3>Total Daily Revenue</h3>
-            <div class="value" style="color: #c8102e;">{config.CURRENCY} {total_rev:.0f}</div>
-        </div>
-        <div class="card">
-            <h3>Total Sessions</h3>
-            <div class="value">{total_sessions}</div>
-        </div>
-        <div class="card">
-            <h3>Average / Session</h3>
-            <div class="value">{config.CURRENCY} {total_rev/total_sessions:.0f}</div>
-        </div>
-    </div>
+        summary = tk.Frame(self._content, bg=config.COLOR_BG, padx=16, pady=12)
+        summary.pack(fill=tk.X)
 
-    <table>
-        <thead>
-            <tr>
-                <th>Time</th>
-                <th>PC</th>
-                <th>Customer</th>
-                <th>Duration</th>
-                <th>Amount Charged</th>
-                <th>Payment</th>
-                <th>Status</th>
-            </tr>
-        </thead>
-        <tbody>
-            {rows_html}
-        </tbody>
-    </table>
-</body>
-</html>"""
+        # Cards are built from whatever the ledger actually contains, so new
+        # transaction types show up here without a code change.
+        cards = sorted(totals.items(), key=lambda item: abs(item[1]["total"]),
+                       reverse=True)[:6]
+        if not cards:
+            tk.Label(summary, text="No money has moved today yet.",
+                     font=("Segoe UI", 10), fg=config.COLOR_TEXT_DIM,
+                     bg=config.COLOR_BG, pady=8).pack(anchor="w")
+        for tx_type, info in cards:
+            total = info["total"]
+            color = config.COLOR_GREEN if total >= 0 else config.COLOR_RED_BRIGHT
+            card = tk.Frame(summary, bg=config.COLOR_BG3, padx=16, pady=10)
+            card.pack(side=tk.LEFT, padx=(0, 10))
+            tk.Label(card, text=f"{config.CURRENCY} {total:.0f}",
+                     font=("Segoe UI", 16, "bold"), fg=color,
+                     bg=config.COLOR_BG3).pack()
+            tk.Label(card, text=f"{tx_type.replace('_', ' ').upper()} ({info['count']})",
+                     font=("Segoe UI", 7), fg=config.COLOR_TEXT_DIM,
+                     bg=config.COLOR_BG3).pack()
 
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(html_content)
+        tk.Label(self._content,
+                 text=f"  Ledger  —  {date_str}   (every money movement)",
+                 font=("Segoe UI", 9, "bold"), fg=config.COLOR_TEXT_DIM,
+                 bg=config.COLOR_BG2, anchor="w", pady=6).pack(fill=tk.X)
+        tk.Frame(self._content, bg=config.COLOR_BORDER, height=1).pack(fill=tk.X)
 
-        self.app.set_status(f"Exported printable report: {path}")
-        if messagebox.askyesno("Open Report", f"Report saved to:\n{path}\n\nOpen in browser now to view/print to PDF?", parent=self):
-            webbrowser.open(f"file:///{path.replace(os.sep, '/')}")
+        header = tk.Frame(self._content, bg=config.COLOR_BG3)
+        header.pack(fill=tk.X)
+        for text, width in (("Time", 10), ("Type", 16), ("PC", 14),
+                            ("Member", 18), ("Amount", 12), ("Note", 40)):
+            tk.Label(header, text=text, font=("Segoe UI", 8, "bold"),
+                     fg=config.COLOR_TEXT_DIM, bg=config.COLOR_BG3,
+                     width=width, anchor="w", padx=6, pady=6).pack(side=tk.LEFT)
 
+        container = tk.Frame(self._content, bg=config.COLOR_BG)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        if not entries:
+            tk.Label(container, text="No ledger entries for today yet.",
+                     font=("Segoe UI", 10), fg=config.COLOR_TEXT_DIM,
+                     bg=config.COLOR_BG, pady=24).pack()
+            return
+
+        for entry in entries:
+            amount = float(entry.get("amount") or 0)
+            color = config.COLOR_GREEN if amount > 0 else config.COLOR_RED_BRIGHT
+            row = tk.Frame(container, bg=config.COLOR_BG)
+            row.pack(fill=tk.X)
+            values = (
+                (str(entry.get("timestamp") or "")[11:16], 10, config.COLOR_TEXT_DIM),
+                (str(entry.get("type") or "").replace("_", " ").title(), 16, config.COLOR_TEXT),
+                (str(entry.get("pc_name") or "—"), 14, config.COLOR_TEXT_DIM),
+                (str(entry.get("member_name") or "—"), 18, config.COLOR_TEXT_DIM),
+                (f"{config.CURRENCY} {amount:.0f}", 12, color),
+                (str(entry.get("notes") or "")[:60], 40, config.COLOR_TEXT_DIM),
+            )
+            for text, width, fg in values:
+                tk.Label(row, text=text, font=("Segoe UI", 8), fg=fg,
+                         bg=config.COLOR_BG, width=width, anchor="w",
+                         padx=6, pady=2).pack(side=tk.LEFT)

@@ -15,8 +15,11 @@ else:
 sys.path.insert(0, ROOT_DIR)
 import config
 import database as db
+from server import printer
 from server.pc_card import PCCard, CARD_W, CARD_H
-from server.dialogs import StartSessionDialog, StopSessionDialog
+from server.server_core import implied_rate
+from server.dialogs import (AddTimeDialog, ManageGroupsDialog, ReceiptWindow,
+                            StartSessionDialog, StopSessionDialog)
 
 GRID_PAD_X = 18
 GRID_PAD_Y = 18
@@ -88,6 +91,13 @@ class Dashboard(tk.Frame):
                                         activeforeground=config.COLOR_TEXT)
         self._group_menu.pack(side=tk.LEFT, padx=2)
 
+        tk.Button(bar, text="Manage Groups…", command=self._manage_groups,
+                  font=("Segoe UI", 8), bg=config.COLOR_BG3,
+                  fg=config.COLOR_TEXT_DIM, relief=tk.FLAT, padx=8, pady=3,
+                  cursor="hand2", bd=0,
+                  activebackground=config.COLOR_RED,
+                  activeforeground=config.COLOR_TEXT).pack(side=tk.LEFT, padx=(6, 0))
+
         btn_cfg = dict(font=("Segoe UI", 8, "bold"), bg=config.COLOR_BG3,
                        fg=config.COLOR_TEXT, relief=tk.FLAT, padx=10, pady=4,
                        cursor="hand2", activebackground=config.COLOR_RED,
@@ -142,17 +152,35 @@ class Dashboard(tk.Frame):
         self._update_canvas_size()
 
     def on_pc_update(self, clients: dict):
+        remembered = {p["pc_name"]: p for p in db.get_all_pcs()}
+
+        def display_name(pc_name):
+            pc = remembered.get(pc_name) or {}
+            return pc.get("display_name") or pc_name
+
         for name, card in self.cards.items():
             if name not in clients:
-                card.update_data(config.STATUS_OFFLINE)
+                # Offline: show whether a paid session is still being held
+                # for this PC (it will resume on reconnect — 2B/2D).
+                session = db.get_open_session(name)
+                held = bool(session and session["status"] == "suspended")
+                card.update_data(
+                    config.STATUS_OFFLINE,
+                    user=(session or {}).get("guest_name")
+                         or card.session_user or "",
+                    remaining_secs=int((session or {}).get("remaining_secs") or 0),
+                    suspended=held)
         for pc_name, client in clients.items():
             if pc_name not in self.cards:
                 self._add_card(pc_name)
-            self.cards[pc_name].update_data(
+            card = self.cards[pc_name]
+            card.set_display_name(display_name(pc_name))
+            card.update_data(
                 status=client.status,
                 user=client.session_user or "",
                 remaining_secs=client.remaining_secs,
-                paused=client.paused)
+                paused=client.paused,
+                suspended=getattr(client, "suspended", False))
         total  = len(self.cards)
         active = sum(1 for c in clients.values() if c.status == config.STATUS_ACTIVE)
         self._count_lbl.config(text=f"{active} active / {total} total")
@@ -164,13 +192,14 @@ class Dashboard(tk.Frame):
     def _load_remembered_pcs(self):
         remembered = db.get_all_pcs()
         for pc in remembered:
-            self._add_card(pc["pc_name"], col=pc["grid_x"], row=pc["grid_y"])
+            card = self._add_card(pc["pc_name"], col=pc["grid_x"], row=pc["grid_y"])
+            card.set_display_name(pc.get("display_name") or pc["pc_name"])
         if not remembered:
             self._empty_lbl.place(relx=0.5, rely=0.4, anchor="center")
 
     def _add_card(self, pc_name: str, col: int = None, row: int = None):
         if pc_name in self.cards:
-            return
+            return self.cards[pc_name]
         if col is None or row is None:
             col, row = self._next_position()
         self.positions[pc_name] = (col, row)
@@ -181,6 +210,7 @@ class Dashboard(tk.Frame):
         card.place(x=x, y=y, width=CARD_W, height=CARD_H)
         self.cards[pc_name] = card
         self._update_canvas_size()
+        return card
 
     def _next_position(self) -> tuple:
         used = set(self.positions.values())
@@ -277,6 +307,8 @@ class Dashboard(tk.Frame):
             self._dialog_change_group(pc_name)
         elif command == "assign_plan":
             self._dialog_assign_plan(pc_name)
+        elif command == "force_close":
+            self._force_close(pc_name)
         elif command == "session_info":
             self._show_session_info(pc_name)
 
@@ -284,15 +316,20 @@ class Dashboard(tk.Frame):
         def _on_start(pc_name, user, duration_mins, amount,
                       member_id=None, payment_type="cash",
                       discount_pct=0.0, discount_amount=0.0):
-            self.server.start_session(
+            # The server validates the wallet and does the deduction —
+            # one place for the money, so dashboards can never double-charge.
+            result = self.server.start_session(
                 pc_name=pc_name, user=user,
                 duration_mins=duration_mins, amount=amount,
                 member_id=member_id, payment_type=payment_type,
-                discount_pct=discount_pct, discount_amount=discount_amount
-            )
-            if member_id and payment_type == "balance":
-                db.deduct_member_balance(member_id, amount)
-            self.app.set_status(f"Session started — {pc_name} ({user})")
+                discount_pct=discount_pct, discount_amount=discount_amount)
+            if not result.get("ok"):
+                messagebox.showerror("Could not start the session",
+                                     result.get("error", "Unknown error"),
+                                     parent=self)
+                return
+            self.app.set_status(f"Session started — {pc_name} ({user}, "
+                                f"{config.CURRENCY} {amount:.0f})")
             self.app.refresh_revenue()
 
         StartSessionDialog(self, pc_name=pc_name, on_start=_on_start)
@@ -301,7 +338,7 @@ class Dashboard(tk.Frame):
         card = self.cards.get(pc_name)
         if not card:
             return
-        session = db.get_active_session(pc_name)
+        session = db.get_open_session(pc_name)
         session_info = {
             "user":         card.session_user or "Guest",
             "duration_mins":session["duration_mins"] if session else 0,
@@ -312,13 +349,57 @@ class Dashboard(tk.Frame):
         }
 
         def _on_confirm(payment_type="cash", actual_amount=None):
-            self.server.stop_session(pc_name, actual_amount=actual_amount)
-            self.app.set_status(f"Session stopped — {pc_name}")
+            result = self.server.stop_session(pc_name, actual_amount=actual_amount,
+                                              payment_type=payment_type)
+            if not result.get("ok"):
+                messagebox.showwarning("Stop session", result.get("error", ""),
+                                       parent=self)
+                return
+            self.app.set_status(f"Session stopped — {pc_name}: charged "
+                                f"{config.CURRENCY} {result['charged']:.0f}"
+                                + (f", refund {config.CURRENCY} {result['refund']:.0f}"
+                                   if result.get("refund") else ""))
+            self.show_receipt(result)
             self.app.refresh_revenue()
 
         StopSessionDialog(self, pc_name=pc_name,
                           session_info=session_info,
                           on_confirm=_on_confirm)
+
+    def show_receipt(self, payload: dict, auto_print: bool = None):
+        """Show (and optionally print) the receipt for a settled session."""
+        if not payload:
+            return
+        ReceiptWindow(self, payload)
+        if auto_print is None:
+            auto_print = db.get_bool_setting("auto_print_receipt", True)
+        if auto_print:
+            shop = db.get_setting("shop_name", config.APP_NAME)
+            printer_name = db.get_setting("receipt_printer", "")
+            ok, message = printer.print_receipt(payload, shop_name=shop,
+                                                currency=config.CURRENCY,
+                                                printer_name=printer_name)
+            if not ok:
+                self.app.set_status(f"Receipt not printed: {message}")
+
+    def _force_close(self, pc_name: str):
+        session = db.get_open_session(pc_name)
+        if not session:
+            messagebox.showinfo("Force close",
+                                f"{pc_name} has no open session.", parent=self)
+            return
+        if not messagebox.askyesno(
+                "Force close session",
+                f"Close the session on {pc_name} without a connected PC?\n\n"
+                f"Prepaid: {config.CURRENCY} {session['amount_charged']:.0f} is kept.",
+                icon="warning", parent=self):
+            return
+        result = self.server.force_close_session(pc_name, keep_prepaid=True)
+        if result.get("ok"):
+            self.app.set_status(f"Force-closed stale session on {pc_name}")
+            self.app.refresh_revenue()
+        else:
+            messagebox.showwarning("Force close", result.get("error", ""), parent=self)
 
     def _dialog_send_message(self, pc_name: str):
         msg = simpledialog.askstring("Send Message",
@@ -329,22 +410,57 @@ class Dashboard(tk.Frame):
             self.app.set_status(f"Message sent to {pc_name}")
 
     def _dialog_add_time(self, pc_name: str):
-        mins = simpledialog.askinteger("Add Time",
-                                       f"Add how many minutes to {pc_name}?",
-                                       minvalue=1, maxvalue=300, parent=self)
-        if mins:
-            self.server.add_time(pc_name, mins)
-            self.app.set_status(f"+{mins} min added to {pc_name}")
+        """Phase 5D — add PAID time; the server persists and logs it."""
+        session = db.get_open_session(pc_name)
+        if not session:
+            messagebox.showinfo("Add Time", f"{pc_name} has no running session.",
+                                parent=self)
+            return
+
+        rate = implied_rate(session)
+
+        def _on_add(minutes, amount, payment_type):
+            result = self.server.add_time(pc_name, minutes, amount,
+                                          payment_type=payment_type)
+            if not result.get("ok"):
+                messagebox.showerror("Add time", result.get("error", ""), parent=self)
+                return
+            self.app.set_status(f"+{minutes} min on {pc_name}"
+                                + (f" ({config.CURRENCY} {amount:.0f})" if amount else ""))
+            self.app.refresh_revenue()
+
+        AddTimeDialog(self, pc_name=pc_name, rate_per_hour=rate,
+                      member_id=session.get("member_id"),
+                      payment_type=session.get("payment_type", "cash"),
+                      on_add=_on_add)
 
     def _dialog_rename(self, pc_name: str):
+        pc = db.get_pc_by_name(pc_name) or {}
+        current = pc.get("display_name") or pc_name
         new_name = simpledialog.askstring("Rename PC",
-                                          f"New display name for {pc_name}:",
-                                          parent=self)
-        if new_name and new_name.strip():
+                                          f"Display name for {pc_name}:",
+                                          initialvalue=current, parent=self)
+        if new_name and new_name.strip() and new_name.strip() != current:
+            new_name = new_name.strip()
+            db.update_pc_display_name(pc_name, new_name)     # 5E — persisted now
             card = self.cards.get(pc_name)
             if card:
-                card._name_lbl.config(text=new_name.strip())
-            self.app.set_status(f"PC renamed to {new_name.strip()}")
+                card.set_display_name(new_name)
+            self.app.set_status(f"{pc_name} is now shown as “{new_name}”")
+
+    def _manage_groups(self):
+        """Phase 5F — create/rename/delete groups (not just assign them)."""
+        def _changed():
+            self._refresh_group_menu()
+            self._filter_group_var.set("All Groups")
+            self._apply_group_filter()
+            self.app.set_status("PC groups updated")
+
+        ManageGroupsDialog(self, on_changed=_changed)
+
+    def _groups_changed(self):
+        self._refresh_group_menu()
+        self._apply_group_filter()
 
     def _dialog_assign_plan(self, pc_name: str):
         """Phase 4C — Assign a specific pricing plan to this PC."""
@@ -464,7 +580,6 @@ class Dashboard(tk.Frame):
 
     def _dialog_change_group(self, pc_name: str):
         """Phase 5F — Assign PC to a group (e.g. VIP, Console, Floor 1)."""
-        existing_groups = db.get_all_pc_groups()
         pc = db.get_pc_by_name(pc_name)
         curr_group = pc.get("group_name") if pc else "Default"
 
